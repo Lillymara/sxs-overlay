@@ -6,14 +6,21 @@ import android.content.Intent;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.database.Cursor;
 import android.provider.MediaStore;
+import android.provider.OpenableColumns;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
 
 /**
  * Opens the phone's picker for an {@code <input type="file">} on the site, and hands the picked files
  * back to the overlay's WebView. The overlay is a service, and only an activity can show a picker.
  *
- * Images use Android's photo picker (screenshots are right there), whose read access lasts as long
- * as the app runs, so the page can read the files after this activity closes.
+ * Images use Android's photo picker (screenshots are right there). The read access a picker grants
+ * can end as soon as this activity closes, before the page gets to the files, so each picked file is
+ * copied into the app's cache first and the page gets those copies.
  */
 public class PickerActivity extends Activity {
     static final String EXTRA_MULTIPLE = "multiple";
@@ -79,8 +86,55 @@ public class PickerActivity extends Activity {
                 uris = new Uri[] {data.getData()};
             }
         }
-        deliver(uris);
-        finish();
+        if (uris == null) {
+            deliver(null);
+            finish();
+            return;
+        }
+        final Uri[] picked = uris;
+        new Thread(() -> {
+            Uri[] copies = copyAll(picked);
+            runOnUiThread(() -> {
+                deliver(copies);
+                finish();
+            });
+        }).start();
+    }
+
+    /** Copies picked files into cache/picks (cleared each time). A file that can't be copied is passed on as is. */
+    private Uri[] copyAll(Uri[] uris) {
+        File dir = new File(getCacheDir(), "picks");
+        File[] old = dir.listFiles();
+        if (old != null) for (File f : old) f.delete();
+        dir.mkdirs();
+        Uri[] out = new Uri[uris.length];
+        for (int i = 0; i < uris.length; i++) {
+            out[i] = uris[i];
+            if (uris[i] == null) continue;
+            File f = new File(dir, i + "-" + safeName(displayName(uris[i]), i));
+            try (InputStream in = getContentResolver().openInputStream(uris[i]); OutputStream o = new FileOutputStream(f)) {
+                if (in == null) continue;
+                byte[] buf = new byte[64 * 1024];
+                for (int n; (n = in.read(buf)) > 0; ) o.write(buf, 0, n);
+                out[i] = Uri.fromFile(f);
+            } catch (Exception e) {
+                f.delete();
+            }
+        }
+        return out;
+    }
+
+    private String displayName(Uri uri) {
+        try (Cursor c = getContentResolver().query(uri, new String[] {OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (c != null && c.moveToFirst()) return c.getString(0);
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    private static String safeName(String name, int i) {
+        if (name == null || name.isEmpty()) return "screenshot" + i + ".jpg";
+        return name.replaceAll("[^A-Za-z0-9._-]", "_");
     }
 
     @Override
